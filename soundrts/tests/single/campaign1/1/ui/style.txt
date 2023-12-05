@@ -1,2 +1,0 @@
-def peasant
-noise 7

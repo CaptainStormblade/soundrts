@@ -21,7 +21,7 @@ from .worldorders import (
     UpgradeToOrder,
 )
 from .worldresource import Corpse, Deposit
-from .worldroom import Square
+from .worldroom import Square, Inside, ZoomTarget
 
 DISTANCE_MARGIN = 175  # millimeters
 
@@ -33,24 +33,27 @@ def ground_or_air(t):
 class Creature(Entity):
 
     damage_vs: dict = dict()
+    armor_vs: dict = dict()
 
     @classmethod
     def interpret(cls, d):
-        dmg = d.get("damage_vs", [])
-        d["damage_vs"] = dict()
-        targets = []
-        for s in dmg:
-            try:
-                n = to_int(s)
-                for t in targets:
-                    d["damage_vs"][t] = n
-                targets = []
-            except ValueError:
-                targets.append(s)
+        for vs_attr in ["damage_vs", "armor_vs"]:
+            dmg = d.get(vs_attr, [])
+            d[vs_attr] = dict()
+            targets = []
+            for s in dmg:
+                try:
+                    n = to_int(s)
+                    for t in targets:
+                        d[vs_attr][t] = n
+                    targets = []
+                except ValueError:
+                    targets.append(s)
 
     type_name: Optional[str] = None
     is_a_unit = False
     is_a_building = False
+    stat_type = None
 
     def get_action_target(self):
         if self.action:
@@ -59,7 +62,7 @@ class Creature(Entity):
     def set_action_target(self, value):
         if isinstance(value, tuple):
             self.action = MoveXYAction(self, value)
-        elif type(value).__name__ == "ZoomTarget":
+        elif isinstance(value, ZoomTarget):
             self.action = MoveXYAction(self, (value.x, value.y))
         elif self.is_an_enemy(value):
             self.action = AttackAction(self, value)
@@ -89,6 +92,7 @@ class Creature(Entity):
 
     is_buildable_anywhere = True
 
+    inside = None
     transport_capacity = 0
     transport_volume = 1
 
@@ -147,45 +151,32 @@ class Creature(Entity):
         return n
 
     def set_player(self, player):
-        # stop current action
         self.stop()
         self.cancel_all_orders(unpay=False)
-        # remove from previous player
-        if self.player is not None:
-            self.player.units.remove(self)
-            self.player.food -= self.food_provided
-            self.player.used_food -= self.food_cost
-        # add to new player
+        if self.player:
+            self.player.remove(self)
+        elif player:
+            player.stats.add("produced", self.stat_type)
         self.player = player
-        if player is not None:
-            self.number = self.next_free_number()
-            player.units.append(self)
-            self.player.food += self.food_provided
-            self.player.used_food += self.food_cost
-            self.upgrade_to_player_level()
-            # player units must stop attacking the "not hostile anymore" unit
-            for u in player.units:
-                if u.action_target is self:
-                    u.stop()
-            # note: updating perception so quickly shouldn't be necessary
-            # (now that perception isn't strictly limited to squares)
-            # It doesn't take time though.
-            for p in player.allied_vision:
-                p.perception.add(self)  # necessary for example for new building sites
-        # if transporting units, set player for them too
-        for o in self.objects:
-            o.set_player(player)
+        if player:
+            player.add(self)
+        if self.inside:
+            for o in self.inside.objects:
+                o.set_player(player)
+
+    @classmethod
+    def create_from_nowhere(cls):
+        return cls.__new__(cls)
 
     def __init__(self, player, place, x, y, o=90):
+        super().__init__(place, x, y, o)
+        self.position_to_hold = place  # defend the creation place
+
         self.orders = []
-
-        # attributes required by transports and shelters (inside)
-        self.objects = []
-        self.world = place.world
-        self.neighbors = []
-        self.title = []
-
         self.set_player(player)
+
+        if self.transport_capacity:
+            self.inside = Inside(self)
 
         # stats "with a max"
         self.hp = self.hp_max
@@ -199,17 +190,13 @@ class Creature(Entity):
         if self.minimal_damage is None:
             self.minimal_damage = int(0.17 * PRECISION)
 
-        # move to initial place
-        Entity.__init__(self, place, x, y, o)
-        self.position_to_hold = place  # defend the creation place
-
         if self.decay:
             self.time_limit = self.world.time + self.decay
 
     def upgrade_to_player_level(self):
         for upg in self.can_use:
             if upg in self.player.upgrades:
-                self.world.unit_class(upg).upgrade_unit_to_player_level(self)
+                rules.unit_class(upg).upgrade_unit_to_player_level(self)
 
     @property
     def upgrades(self):
@@ -376,7 +363,7 @@ class Creature(Entity):
     # hold
 
     def deploy(self):
-        if type(self.position_to_hold).__name__ == "ZoomTarget":
+        if isinstance(self.position_to_hold, ZoomTarget):
             self.action_target = self.position_to_hold
         elif self.player.smart_units:
             self.action_target = self.player.get_safest_subsquare(self.place)
@@ -386,7 +373,7 @@ class Creature(Entity):
     def is_in_position(self, target):
         if self.place is target:
             return True
-        if type(target).__name__ == "ZoomTarget":
+        if isinstance(target, ZoomTarget):
             return target.contains(self.x, self.y)
 
     def hold(self, target):
@@ -400,9 +387,12 @@ class Creature(Entity):
         return self.range < 2 * PRECISION
 
     def _near_enough_to_aim(self, target):
-        # Melee units shouldn't attack units on the other side of a wall.
-        if self.is_melee and not self._can_go(target.place) and not target.blocked_exit:
-            return False
+        if self.is_melee:
+            if self.is_inside:
+                if self.place.container.airground_type == "air":
+                    return False  # no melee attack from air
+            elif not self._can_go(target.place) and not target.blocked_exit:
+                return False  # no melee attack through a wall
         if (
             self.minimal_range
             and square_of_distance(self.x, self.y, target.x, target.y)
@@ -488,13 +478,15 @@ class Creature(Entity):
 
         self.is_moving = False
 
-        if self.is_inside or self.player is None:
+        if self.player is None:
             return
 
         if self.heal_level:
             self.heal_nearby_units()
         if self.harm_level:
             self.harm_nearby_units()
+        if self.inside:
+            self.inside.update()
 
         if self.player is None:
             return
@@ -537,6 +529,8 @@ class Creature(Entity):
     def receive_hit(self, damage, attacker, notify=True):
         if self.player is None:
             return
+        if attacker.is_inside:
+            attacker = attacker.place.container
         self.player.observe(attacker)
         self._raise_subsquare_threat(damage)
         if notify:
@@ -557,17 +551,20 @@ class Creature(Entity):
 
     def die(self, attacker=None):
         # remove transported units
-        for o in self.objects[:]:
-            o.move_to(self.place, self.x, self.y)
-            if o.place is self:  # not enough space
-                o.collision = 0
+        if self.inside:
+            for o in self.inside.objects[:]:
                 o.move_to(self.place, self.x, self.y)
-            if self.airground_type != "ground":
-                o.die(attacker)
+                if o.place is self.inside:  # not enough space
+                    o.collision = 0
+                    o.move_to(self.place, self.x, self.y)
+                if self.airground_type != "ground":
+                    o.die(attacker)
         self.notify("death")
+        self.player.stats.add("lost", self.stat_type)
         if attacker is not None:
             self.notify("death_by,%s" % attacker.id)
             self.player.on_unit_attacked(self, attacker)
+            attacker.player.stats.add("killed", self.stat_type)
         self.delete()
 
     heal_level = 0
@@ -612,12 +609,12 @@ class Creature(Entity):
             ):
                 return True
             else:
-                return self.player.player_is_an_enemy(c.player)
+                return self.player and self.player.player_is_an_enemy(c.player)
         else:
             return False
 
     def can_attack_if_in_range(self, other):
-        if self.is_inside or not self.damage:
+        if not self.damage:
             return False
         if other not in self.player.perception:
             return False
@@ -642,6 +639,11 @@ class Creature(Entity):
 
     def _choose_enemy(self, place):
         known = self.player.known_enemies(place)
+        if not known:
+            for place in place.strict_neighbors:
+                known = self.player.known_enemies(place)
+                if known:
+                    break
         reachable_enemies = [x for x in known if self.can_attack(x)]
         if reachable_enemies:
             reachable_enemies.sort(
@@ -651,8 +653,15 @@ class Creature(Entity):
                     x.id,
                 )
             )
-            self.action = AttackAction(self, reachable_enemies[0])
+            self._attack(reachable_enemies[0])
             return True
+
+    def _attack(self, target):
+        # don't notify or attack if already attacking the same target
+        # (at the moment, this test is necessary if the target is not a menace, for example a farm)
+        if not isinstance(self.action, AttackAction) or self.action.target != target:
+            self.action = AttackAction(self, target)
+            self.notify("attack")
 
     def flee(self):
         sl = [e.other_side.place for e in self.place.exits]
@@ -666,6 +675,9 @@ class Creature(Entity):
                 self.take_order(["go", s.id], imperative=True)
 
     def decide(self):
+        if self.is_inside:
+            self._choose_enemy(self.place.container.place)
+            return
         if (
             (self.player.smart_units or self.ai_mode == "defensive")
             and self.speed > 0
@@ -685,9 +697,27 @@ class Creature(Entity):
     # attack
 
     def hit(self, target):
-        base_damage = self.damage_vs.get(target.type_name, self.damage)
-        damage = max(self.minimal_damage, base_damage - target.armor)
+        base_damage = self._base_damage_versus(target)
+        damage = max(self.minimal_damage, base_damage - target.armor_versus(self))
         target.receive_hit(damage, self)
+
+    def armor_versus(self, attacker):
+        d = self.armor_vs
+        if attacker.type_name in d:
+            return d[attacker.type_name]
+        for t in attacker.expanded_is_a:
+            if t in d:
+                return d[t]
+        return self.armor
+
+    def _base_damage_versus(self, target):
+        d = self.damage_vs
+        if target.type_name in d:
+            return d[target.type_name]
+        for t in target.expanded_is_a:
+            if t in d:
+                return d[t]
+        return self.damage
 
     def _hit_or_miss(self, target):
         if self.has_hit(target):
@@ -752,7 +782,7 @@ class Creature(Entity):
             if getattr(target, "player", None) is not None:
                 o[0] = "attack"
         if self.is_inside:
-            self.place.notify("order_impossible")
+            self.notify("order_impossible")
             return
         cls = ORDERS_DICT.get(o[0])
         if cls is None:
@@ -899,15 +929,13 @@ class Creature(Entity):
     # transport
 
     def have_enough_space(self, target):
-        s = self.transport_capacity
-        for u in self.objects:
-            s -= u.transport_volume
-        return s >= target.transport_volume
+        if self.inside:
+            return self.inside.have_enough_space(target)
 
     def load(self, target):
         target.cancel_all_orders()
         target.notify("enter")
-        target.move_to(self, 0, 0)
+        target.move_to(self.inside, 0, 0)
 
     def load_all(self, place=None):
         if place is None:
@@ -926,7 +954,7 @@ class Creature(Entity):
         else:
             x = place.x
             y = place.y
-        for o in self.objects[:]:
+        for o in self.inside.objects[:]:
             o.move_to(place, x, y)
             o.notify("exit")
 
@@ -940,6 +968,20 @@ class Creature(Entity):
     def is_idle(self):
         return self.action_target is None
 
+    def counterattack(self, place):
+        if (
+            self.speed
+            and self.menace
+            and self.ai_mode == "offensive"
+            and not self.orders
+            and self.action.__class__ != AttackAction
+            and self._can_go(place)
+        ):
+            self.take_order(["go", place.id])
+            self.take_order(
+                ["go", f"zoom-{self.place.id}-{self.x}-{self.y}"], forget_previous=False
+            )
+
 
 class Unit(Creature):
 
@@ -949,14 +991,7 @@ class Unit(Creature):
     is_a_gate = True
     is_a_unit = True
 
-    def __init__(self, player, place, x, y, o=90):
-        Creature.__init__(self, player, place, x, y, o)
-        self.player.nb_units_produced += 1
-
     def die(self, attacker=None):
-        self.player.nb_units_lost += 1
-        if attacker:
-            attacker.player.nb_units_killed += 1
         if self.corpse:
             Corpse(self)
         Creature.die(self, attacker)
@@ -978,17 +1013,19 @@ class Unit(Creature):
             return next_stage
 
     def next_stage(self, target, avoid=False):
+        if self.is_inside:
+            return
         if target is None or target.place is None:
             return None
-        if not hasattr(target, "exits"):  # target is not a square
+        if not isinstance(target, Square):
             if self.place == target.place:
                 return target
             place = target.place
-        else:  # target is a square
+        else:
             if self.place == target:
                 return None
             place = target
-        if not hasattr(place, "exits"):  # not a square
+        if not isinstance(place, Square):
             return None
         self.distance_to_goal = self.place.shortest_path_distance_to(
             place, player=self.player, plane=self.airground_type, avoid=avoid
@@ -1068,6 +1105,7 @@ class Worker(Unit):
     _basic_abilities = {"go", "attack", "gather", "repair", "block", "join_group"}
     is_teleportable = True
     cargo = None  # gathered resource
+    stat_type = "unit"
 
     def decide(self):
         Unit.decide(self)
@@ -1117,6 +1155,7 @@ class Soldier(Unit):
     can_switch_ai_mode = True
     _basic_abilities = {"go", "attack", "patrol", "block", "join_group"}
     is_teleportable = True
+    stat_type = "unit"
 
 
 class Effect(Unit):
@@ -1144,13 +1183,7 @@ class _Building(Creature):
 
     corpse = 0
 
-    def __init__(self, player, square, x=0, y=0):
-        Creature.__init__(self, player, square, x, y)
-
     def die(self, attacker=None):
-        self.player.nb_buildings_lost += 1
-        if attacker:
-            attacker.player.nb_buildings_killed += 1
         place, x, y = self.place, self.x, self.y
         Creature.die(self, attacker)
         if self.building_land:
@@ -1163,8 +1196,8 @@ class BuildingSite(_Building):
     basic_abilities = {"cancel_building"}
 
     def __init__(self, player, place, x, y, building_type):
+        super().__init__(player, place, x, y)
         player.pay(building_type.cost)
-        _Building.__init__(self, player, place, x, y)
         self.type = building_type
         self.hp_max = building_type.hp_max
         self._starting_hp = building_type.hp_max * 5 // 100
@@ -1225,7 +1258,4 @@ class Building(_Building):
     is_buildable_on_exits_only = False
     is_buildable_near_water_only = False
     provides_survival = True
-
-    def __init__(self, player, place, x, y):
-        _Building.__init__(self, player, place, x, y)
-        self.player.nb_buildings_produced += 1
+    stat_type = "building"

@@ -1,31 +1,29 @@
 import copy
-import os.path
 import queue
 import random
 import re
 import string
 import time
 from hashlib import md5
+from itertools import chain
 
 from soundrts.lib.nofloat import square_of_distance
-
-from . import res
-from .definitions import VIRTUAL_TIME_INTERVAL, get_ai_names, load_ai, rules
+from .definitions import VIRTUAL_TIME_INTERVAL, get_ai_names, rules
 from .lib import chronometer as chrono
 from .lib import collision
+from .lib.defs import preprocess
 from .lib.log import exception, warning
 from .lib.nofloat import PRECISION, int_distance, to_int
-from .paths import MAPERROR_PATH
-from .worldability import Ability
+from .lib.resource import res
 from .worldclient import DummyClient
 from .worldentity import COLLISION_RADIUS
 from .worldexit import passage
 from .worldorders import ORDERS_DICT
 from .worldplayerbase import A, Player
-from .worldresource import Deposit, Meadow
+from .worldresource import Meadow
 from .worldroom import Square
-from .worldunit import Building, Effect, Soldier, Unit, Worker, ground_or_air
-from .worldupgrade import Upgrade
+from .worldunit import ground_or_air
+from .worldupgrade import is_an_upgrade
 
 GLOBAL_FOOD_LIMIT = 80
 PROFILE = False
@@ -38,11 +36,23 @@ def check_squares(line, squares):
             squares.remove(sq)
 
 
+def convert_and_split_first_numbers(words):
+    i = -1
+    for i, w in enumerate(words):
+        try:
+            words[i] = to_int(w)
+        except ValueError:
+            i -= 1
+            break
+    return words[:i + 1], words[i + 1:]
+
+
 class World:
-    def __init__(self, default_triggers, seed=0, must_apply_equivalent_type=False):
+    def __init__(self, default_triggers=None, seed=0):
+        if default_triggers is None:
+            default_triggers = []
         self.default_triggers = default_triggers
         self.seed = seed
-        self.must_apply_equivalent_type = must_apply_equivalent_type
         self.id = self.get_next_id()
         self.random = random.Random()
         self.random.seed(int(seed))
@@ -110,17 +120,6 @@ class World:
         self.__dict__.update(dict)
         self._command_queue = queue.Queue()
 
-    def remove_links_for_savegame(self):  # avoid pickle recursion problem
-        for z in self.squares:
-            for e in z.exits:
-                e.place = None
-
-    def restore_links_for_savegame(self):
-        for z in self.squares:
-            for e in z.exits:
-                e.place = z
-        self.set_neighbors()
-
     @property
     def turn(self):
         return self.time // VIRTUAL_TIME_INTERVAL
@@ -133,6 +132,16 @@ class World:
             return str(self._next_id)
         else:
             return str(self._next_id + 1)
+
+    def register_entity(self, o):
+        o.id = self.get_next_id()
+        self.objects[o.id] = o
+        if hasattr(o, "update"):
+            self.active_objects.append(o)
+
+    def unregister_entity(self, o):
+        if o in self.active_objects:
+            self.active_objects.remove(o)
 
     # Why use a different id for orders: get_next_id() would have worked too,
     # but with higher risks of synchronization errors. This way is probably
@@ -168,8 +177,8 @@ class World:
             for p in players
             for o in p._potential_neighbors(x, y)
             if o.place is not None
-            and filter(o)
-            and square_of_distance(x, y, o.x, o.y) <= radius_2
+               and filter(o)
+               and square_of_distance(x, y, o.x, o.y) <= radius_2
         ]
 
     def get_place_from_xy(self, x, y):
@@ -182,24 +191,24 @@ class World:
         try:
             return self.harm_target_types[(unit_type_name, other_type_name)]
         except:
-            unit = self.unit_class(unit_type_name)
-            other = self.unit_class(other_type_name)
+            unit = rules.unit_class(unit_type_name)
+            other = rules.unit_class(other_type_name)
             if other is None:
                 result = False
             else:
                 result = True
                 for t in unit.harm_target_type:
                     if (
-                        t == "healable"
-                        and not other.is_healable
-                        or t == "building"
-                        and not other.is_a_building
-                        or t in ("air", "ground")
-                        and ground_or_air(other.airground_type) != t
-                        or t == "unit"
-                        and not other.is_a_unit
-                        or t == "undead"
-                        and not other.is_undead
+                            t == "healable"
+                            and not other.is_healable
+                            or t == "building"
+                            and not other.is_a_building
+                            or t in ("air", "ground")
+                            and ground_or_air(other.airground_type) != t
+                            or t == "unit"
+                            and not other.is_a_unit
+                            or t == "undead"
+                            and not other.is_undead
                     ):
                         result = False
                         break
@@ -377,69 +386,7 @@ class World:
 
     global_food_limit = GLOBAL_FOOD_LIMIT
 
-    # move the following methods to Map
-
-    unit_base_classes = {
-        "worker": Worker,
-        "soldier": Soldier,
-        "building": Building,
-        "effect": Effect,
-        "deposit": Deposit,
-        "upgrade": Upgrade,
-        "ability": Ability,
-    }
-
-    def unit_class(self, s):
-        """Get a custom unit class from its name.
-        
-        Example: unit_class("peasant") to get the peasant class
-
-        At the moment, unit_classes contains also: upgrades, abilities...
-        """
-        try:
-            return rules.classes[s]
-        except KeyError:
-            return
-
-    def _get_classnames(self, condition):
-        result = []
-        for c in rules.classnames():
-            uc = self.unit_class(c)
-            if uc is not None and condition(uc):
-                result.append(c)
-        return result
-
-    def get_makers(self, t):
-        def can_make(uc, t):
-            for a in ("can_build", "can_train", "can_upgrade_to", "can_research"):
-                if t in getattr(uc, a, []):
-                    return True
-            for ability in getattr(uc, "can_use", []):
-                effect = rules.get(ability, "effect")
-                if effect and "summon" in effect[:1] and t in effect:
-                    return True
-
-        if t.__class__ != str:
-            t = t.__name__
-        return self._get_classnames(lambda uc: can_make(uc, t))
-
-    def get_units(self):
-        return self._get_classnames(lambda uc: issubclass(uc.cls, Unit))
-
-    def get_soldiers(self):
-        return self._get_classnames(lambda uc: issubclass(uc.cls, Soldier))
-
-    def get_deposits(self, resource_index):
-        return self._get_classnames(
-            lambda uc: issubclass(uc.cls, Deposit)
-            and uc.resource_type == resource_index
-        )
-
     # map creation
-
-    def set_neighbors(self):
-        for square in set(self.grid.values()):
-            square.set_neighbors()
 
     def _create_squares_and_grid(self):
         self.grid = {}
@@ -460,7 +407,6 @@ class World:
                     square.is_ground = square.name in self.ground_squares
                 if square.name in self.no_air_squares:
                     square.is_air = False
-        self.set_neighbors()
         xmax = self.nb_columns * self.square_width
         res = COLLISION_RADIUS * 2 // 3
         self.collision = {
@@ -484,7 +430,7 @@ class World:
             if z not in self.grid:
                 warning(f"{z} is not a valid coordinate")
                 continue
-            resource_class = self.unit_class(cls)
+            resource_class = rules.unit_class(cls)
             if self.grid[z].can_receive("ground"):  # avoids using the spiral
                 resource = resource_class(self.grid[z], n)
                 resource.building_land = Meadow(self.grid[z])
@@ -598,9 +544,9 @@ class World:
     def _add_start_to(self, starts, resources, items, sq=None):
         def is_a_square(x):
             return (
-                x[0] in string.ascii_letters
-                and x[1] in string.digits
-                and (len(x) == 2 or len(x) == 3 and x[2] in string.digits)
+                    x[0] in string.ascii_letters
+                    and x[1] in string.digits
+                    and (len(x) == 2 or len(x) == 3 and x[2] in string.digits)
             )
 
         start = []
@@ -614,31 +560,24 @@ class World:
             elif re.match("[0-9]+$", x):
                 multiplicator = int(x)
             else:
-                start.append((sq, self.unit_class(x), multiplicator))
+                start.append((sq, rules.unit_class(x), multiplicator))
                 multiplicator = 1
         starts.append([resources, start, []])
 
     @property
     def nb_res(self):
-        return rules.get("parameters", "nb_of_resource_types")
+        return rules.get("parameters", "nb_of_resource_types", 2)
 
-    def _add_start(self, w, words, line):
-        # get start type
+    def _add_start(self, w, words):
         if w == "player":
             n = "players_starts"
         else:
             n = "computers_starts"
-        # get resources
-        starting_resources = []
-        for c in words[1 : 1 + self.nb_res]:
-            try:
-                starting_resources.append(to_int(c))
-            except:
-                map_error(line, "expected an integer but found %s" % c)
-        # build start
-        self._add_start_to(
-            getattr(self, n), starting_resources, words[1 + self.nb_res :]
-        )
+        resources, units = convert_and_split_first_numbers(words[1:])
+        if len(resources) != self.nb_res:
+            warning("the map have %s resources while the rules have %s resources",
+                 len(resources), self.nb_res)
+        self._add_start_to(getattr(self, n), resources, units)
 
     def _list_to_tree(self, words):
         cache = [[]]
@@ -683,7 +622,7 @@ class World:
     def random_choice_repl(self, matchobj):
         return self.random.choice(matchobj.group(1).split("\n#end_choice\n"))
 
-    def _load_map(self, map):
+    def _parse_map(self, map_definition):
         triggers = []
         starting_resources = [0 for _ in range(self.nb_res)]
 
@@ -694,10 +633,8 @@ class World:
             "high_grounds",
         ]
 
-        s = map.read()  # "universal newlines"
-        s = re.sub("(?m);.*$", "", s)  # remove comments
-        s = re.sub("(?m)^[ \t]*$\n", "", s)  # remove empty lines
-        s = re.sub(r"(?m)\\[ \t]*$\n", " ", s)  # join lines ending with "\"
+        s = map_definition  # "universal newlines"
+        s = preprocess(s)
         s = s.replace("(", " ( ")
         s = s.replace(")", " ) ")
         s = re.sub(r"\s*\n\s*", r"\n", s)  # strip lines
@@ -723,13 +660,13 @@ class World:
                     if _w and _w[0] == "-":
                         _w = _w[1:]
                     if (
-                        re.match("^([a-z]+[0-9]+|[0-9]+(.[0-9]*)?|.[0-9]+)$", _w)
-                        is None
-                        and not hasattr(Player, "lang_" + _w)
-                        and _w not in rules.classnames()
-                        and _w not in get_ai_names()
-                        and _w not in ["(", ")", "all", "players", "computers"]
-                        and _w not in ORDERS_DICT
+                            re.match("^([a-z]+[0-9]+|[0-9]+(.[0-9]*)?|.[0-9]+)$", _w)
+                            is None
+                            and not hasattr(Player, "lang_" + _w)
+                            and _w not in rules.classnames()
+                            and _w not in get_ai_names()
+                            and _w not in ["(", ")", "all", "players", "computers"]
+                            and _w not in ORDERS_DICT
                     ):
                         map_error(line, "unknown: %s" % _w)
             if w in ["title", "objective", "intro"]:
@@ -778,7 +715,7 @@ class World:
                 getattr(self, w).extend(words[1:])  # TODO: error msg (types)
             elif w in ["player", "computer_only", "computer"]:
                 self.specific_starts.append(" ".join(words))  # just for the editor
-                self._add_start(w, words, line)
+                self._add_start(w, words)
             elif w == "trigger":
                 triggers.append(words[1:])
             elif w == "terrain":
@@ -830,34 +767,13 @@ class World:
             self._add_trigger(t)
 
     def load_and_build_map(self, map):
-        if os.path.exists(MAPERROR_PATH):
-            try:
-                os.remove(MAPERROR_PATH)
-            except:
-                warning("cannot remove map error file")
-        try:
-            rules.load(
-                res.get_text_file("rules", append=True),
-                map.campaign_rules,
-                map.additional_rules,
-                classes=self.unit_base_classes,
-            )
-            load_ai(
-                res.get_text_file("ai", append=True), map.campaign_ai, map.additional_ai
-            )
-            self._load_map(map)
-            self.map = map
-            self.square_width = int(self.square_width * PRECISION)
-            self._build_map()
-        except MapError as msg:
-            warning("map error: %s", msg)
-            self.map_error = "map error: %s" % msg
-            return False
-        return True
+        res.set_map(map)
+        res.load_rules_and_ai()  # TODO: remove this line when tests don't require it
 
-    @property
-    def factions(self):
-        return [c for c in rules.classnames() if rules.get(c, "class") == ["faction"]]
+        self._parse_map(map.definition)
+
+        self.square_width = int(self.square_width * PRECISION)
+        self._build_map()
 
     # move this to Game?
 
@@ -876,34 +792,57 @@ class World:
         return [p for p in self.true_players() if p.is_playing]
 
     @property
+    def at_least_two_camps(self):
+        first_camp = self.true_playing_players[0].allied_victory
+        for player in self.true_playing_players:
+            if player not in first_camp:
+                return True
+
+    @property
     def food_limit(self):
         return self.global_food_limit
 
-    def _add_player(self, client, start):
-        player = client.player_class(self, client)
-        player.start = start
-        client.player = player
-        self.players.append(player)
-
-    def _create_true_players(self, players, random_starts):
-        starts = self.players_starts[:]
+    def populate_map(self, clients, random_starts=True, equivalents=False):
         if random_starts:
-            self.random.shuffle(starts)
-        for client in players:
-            start = starts.pop(0)
-            self._add_player(client, start)
-        for p in self.players:
-            p.init_alliance()
-
-    def _create_neutrals(self):
-        for start in self.computers_starts:
-            self._add_player(DummyClient(neutral=True), start)
-
-    def populate_map(self, players, random_starts=True):
-        self._create_true_players(players, random_starts)
-        self._create_neutrals()
+            players_starts = self.random.sample(self.players_starts, len(clients))
+        else:
+            players_starts = self.players_starts[:len(clients)]
+        for client in clients:
+            client.create_player(self)
         for player in self.players:
-            player.init_position()
+            player.init_alliance()
+        for _ in self.computers_starts:
+            DummyClient(neutral=True).create_player(self)
+        starts = chain(players_starts, self.computers_starts)
+        for player, start in zip(self.players, starts):
+            parsed_start = self.parse_start(start, player.faction, equivalents)
+            player.init_position(parsed_start)
+
+    def parse_start(self, start, faction, must_apply_equivalent_type):
+        resources = rules.normalized_cost_or_resources(start[0])
+        units, upgrades, forbidden_techs = self.parse_assets(start, faction, must_apply_equivalent_type)
+        triggers = start[2]
+        return units, upgrades, forbidden_techs, resources, triggers
+
+    def parse_assets(self, start, faction, must_apply_equivalent_type):
+        units = []
+        upgrades = []
+        forbidden_techs = []
+        for place, type_, n in start[1]:
+            if must_apply_equivalent_type:
+                type_ = rules.equivalent_type(type_, faction)
+            if isinstance(type_, str) and type_[0:1] == "-":
+                forbidden_techs.append(type_[1:])
+            elif is_an_upgrade(type_):
+                upgrades.append(
+                    type_.type_name
+                )  # type_.upgrade_player(self) would require the units already there
+            elif not type_:
+                warning("couldn't create an initial unit")
+            else:
+                place = self.grid[place]
+                units.append((place, n, type_))
+        return units, upgrades, forbidden_techs
 
     def stop(self):
         self._must_loop = False
@@ -988,7 +927,7 @@ class World:
                 f.write("{} {} {}\n".format(t, q, " ".join(squares)))
             f.write("\nnb_meadows_by_square 0\n")
             for n in sorted(
-                {s.nb_meadows for s in list(self.grid.values()) if s.nb_meadows}
+                    {s.nb_meadows for s in list(self.grid.values()) if s.nb_meadows}
             ):
                 squares = _sorted(
                     [s.name for s in set(self.grid.values()) if s.nb_meadows == n]
@@ -1001,7 +940,7 @@ class World:
                     f.write("additional_meadows %s\n" % " ".join(squares))
             f.write("\n")
             for t in sorted(
-                {s.type_name for s in list(self.grid.values()) if s.type_name}
+                    {s.type_name for s in list(self.grid.values()) if s.type_name}
             ):
                 squares = _sorted(
                     [s.name for s in set(self.grid.values()) if s.type_name == t]
@@ -1020,11 +959,11 @@ class World:
             squares = _sorted([s.name for s in set(self.grid.values()) if not s.is_air])
             f.write("no_air %s\n" % " ".join(squares))
             for t in sorted(
-                {
-                    s.terrain_cover
-                    for s in list(self.grid.values())
-                    if s.terrain_cover != (0, 0)
-                }
+                    {
+                        s.terrain_cover
+                        for s in list(self.grid.values())
+                        if s.terrain_cover != (0, 0)
+                    }
             ):
                 squares = _sorted(
                     [s.name for s in set(self.grid.values()) if s.terrain_cover == t]
@@ -1035,11 +974,11 @@ class World:
                     )
                 )
             for t in sorted(
-                {
-                    s.terrain_speed
-                    for s in list(self.grid.values())
-                    if s.terrain_speed != (100, 100)
-                }
+                    {
+                        s.terrain_speed
+                        for s in list(self.grid.values())
+                        if s.terrain_speed != (100, 100)
+                    }
             ):
                 squares = _sorted(
                     [s.name for s in set(self.grid.values()) if s.terrain_speed == t]
@@ -1071,26 +1010,18 @@ class World:
 
 
 class MapError(Exception):
-
     pass
 
 
 def map_error(line, msg):
-    msg = f"error: {msg}"
-    if line:
-        msg += f' (in "{line}")'
-    try:
-        open(MAPERROR_PATH, "w").write(msg)
-    except:
-        warning("could not write in %s", MAPERROR_PATH)
-    raise MapError(msg)
+    raise MapError(_formatted_msg(line, msg))
 
 
 def map_warning(line, msg):
+    warning(_formatted_msg(line, msg))
+
+
+def _formatted_msg(line, msg):
     if line:
         msg += f' (in "{line}")'
-    warning(msg)
-    try:
-        open(MAPERROR_PATH, "w").write(msg)
-    except:
-        warning("could not write in %s", MAPERROR_PATH)
+    return msg

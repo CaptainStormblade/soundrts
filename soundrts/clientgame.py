@@ -1,7 +1,9 @@
+import cProfile
 import math
 import queue
 import re
 import sys
+import threading
 import time
 
 import pygame
@@ -18,17 +20,18 @@ from pygame.locals import (
 
 from . import config
 from . import msgparts as mp
-from .clientgameentity import EntityView
+from . import parameters
+from .animation import noise
+from .clientgameentity import EntityView, SquareView
 from .clientgamefocus import Zoom
 from .clientgamegridview import GridView
 from .clientgamenews import must_be_said
-from .clientgameorder import OrderTypeView, nb2msg_f
+from .clientgameorder import OrderTypeView, nb2msg_f, update_orders_list
 from .clienthelp import help_msg
 from .clientmedia import (
     get_fullscreen,
     modify_volume,
     play_sequence,
-    sound_stop,
     sounds,
     toggle_fullscreen,
     voice,
@@ -36,20 +39,25 @@ from .clientmedia import (
 from .clientmenu import Menu, input_string
 from .definitions import VIRTUAL_TIME_INTERVAL, style
 from .lib import chronometer as chrono
-from .lib import group
+from .lib import group, sound
 from .lib.bindings import Bindings
 from .lib.log import exception, warning
 from .lib.mouse import set_cursor
 from .lib.msgs import eval_msg_and_volume, nb2msg
 from .lib.nofloat import PRECISION
+from .lib.resource import res
 from .lib.screen import (
     get_screen,
     screen_render,
     screen_render_subtitle,
     set_game_mode,
 )
-from .lib.sound import angle, distance, psounds, stereo, vision_stereo
+from .lib.sound import angle, distance, psounds, stereo
+from .paths import CUSTOM_BINDINGS_PATH
 from .version import IS_DEV_VERSION
+from .worldroom import Square
+
+PROFILE = False
 
 # minimal interval (in seconds) between 2 sounds
 ALERT_LIMIT = 0.5
@@ -183,7 +191,7 @@ class GameInterface:
         self._known_resource_places = set()
         server.interface = self
         self.grid_view = GridView(self)
-        self.set_self_as_listener()
+        psounds.listener = self
         voice.silent_flush()
         self._srv_queue = queue.Queue()
         self.scouted_squares = ()
@@ -193,15 +201,13 @@ class GameInterface:
     def __getstate__(self):
         odict = self.__dict__.copy()
         del odict["_srv_queue"]
-        odict["_terrain_loop"] = None
         return odict
 
     def __setstate__(self, dictionary):
         self.__dict__.update(dictionary)
         self._srv_queue = queue.Queue()
-
-    def set_self_as_listener(self):
-        psounds.set_listener(self)
+        psounds.listener = self
+        self.waiting_for_world_update = False
 
     @property
     def display_is_active(self):
@@ -274,7 +280,7 @@ class GameInterface:
 
     def srv_quit(self):
         voice.silent_flush()
-        sound_stop()
+        sound.stop()
         self.end_loop = True
 
     def distance(self, o):
@@ -340,37 +346,16 @@ class GameInterface:
         return choices
 
     def say_target(self):
+        d = self.target.positional_description
         if self.an_order_requiring_a_target_is_selected:
-            d, vg, vd = self.get_description_of(self.target)
-            voice.item(d + mp.COMMA + self.order.title, vg, vd)
-        else:
-            voice.item(*self.get_description_of(self.target))
-
-    def get_description_of(self, o):
-        if self.immersion:
-            vg, vd = vision_stereo(self.x, self.y, o.x, o.y, self.o)
-            return (
-                mp.POSITIONAL_BEEP
-                + o.title
-                + mp.AT2
-                + nb2msg(self.distance(o))
-                + mp.METERS
-                + self.direction_to_msg(o)
-                + o.description,
-                vg,
-                vd,
-            )
-        else:
-            self.o = 90
-            vg, vd = vision_stereo(self.x, self.y, o.x, o.y, self.o)
-            return (
-                mp.POSITIONAL_BEEP + o.title + self.direction_to_msg(o) + o.description,
-                vg,
-                vd,
-            )
+            d += mp.COMMA + self.order.title
+        vol = stereo(self.x, self.y, self.target.x, self.target.y, self.o, no_distance=True)
+        if max(vol) < 0.2:
+            vol = 0.2, 0.2
+        voice.item(mp.POSITIONAL_BEEP + d, *vol)
 
     def cmd_examine(self):
-        if self.target is not None:
+        if self.target:
             self.say_target()
         elif self.zoom_mode:
             self.zoom.say()
@@ -500,7 +485,12 @@ class GameInterface:
                 return
             p = self.place
             p.type_name = d["style"]
-            self._terrain_loop_square = None  # must update terrain audio background
+
+            # trigger the update of terrain noises
+            for n in self._terrain_noises[:]:
+                n.stop()
+            self._terrain_noises = []
+
             p.is_water = d["water"]
             p.is_ground = d["ground"]
             p.is_air = d["air"]
@@ -544,6 +534,10 @@ class GameInterface:
         else:
             voice.item(mp.BEEP)
 
+    def cmd_reload_parameters(self):
+        parameters.load()
+        sounds.update_volumes()
+
     def _next_player(self, player):
         players = self.world.players
         index = (players.index(player) + 1) % len(players)
@@ -566,6 +560,43 @@ class GameInterface:
         else:
             voice.item(mp.BEEP)
 
+    _sound = None
+
+    def cmd_select_sound(self, inc=1):
+        h = sounds.cache
+        if self._sound in h:
+            self._sound = h[(h.index(self._sound) + int(inc)) % len(h)]
+        elif h:
+            self._sound = h[0]
+        else:
+            self._sound = None
+        if self._sound:
+            voice.silent_flush()
+            voice.item(
+                [
+                    f"{self._sound.name}, {self._sound.get_volume():.1f}, {self._sound.path}"
+                ]
+            )
+            v = self._sound.get_volume()
+            if v < 0.5:
+                self._sound.set_volume(1)
+            c = self._sound.play(loops=10)
+            if c:
+                c.fadeout(1000)
+            else:
+                warning("couldn't play %s", self._sound.path)
+            if v < 0.5:
+                time.sleep(1)
+                self._sound.set_volume(v)
+
+    def cmd_sound_volume(self, inc=1):
+        if self._sound:
+            self._sound.set_volume(max(self._sound.get_volume() + int(inc) / 10, 0))
+            voice.silent_flush()
+            voice.item(
+                [f"{self._sound.get_volume():.1f}", f"{self._sound.name}",], 1, 1,
+            )
+
     def cmd_volume(self, inc=1):
         modify_volume(int(inc))
 
@@ -587,7 +618,7 @@ class GameInterface:
 
     def cmd_gamemenu(self):
         voice.silent_flush()
-        sound_stop()
+        sound.stop()
         menu = Menu(mp.MENU)
         menu.append(mp.CANCEL_GAME, self.gm_quit)
         if self.is_admin():
@@ -638,7 +669,12 @@ class GameInterface:
         return hasattr(self.server, "save_game")
 
     def gm_save(self):
-        self.server.save_game()
+        try:
+            self.server.save_game()
+            voice.info(mp.OK)
+        except:
+            exception("save game failed")
+            voice.alert(mp.BEEP)
 
     # clock
 
@@ -758,44 +794,43 @@ class GameInterface:
     def _time_to_ask_for_next_update(self):
         return not self.waiting_for_world_update and time.time() >= self.next_update
 
-    _terrain_loop = None
-    _terrain_loop_square = None
+    _terrain_noises = []
 
     def _animate_terrain(self):
-        sq = self.place
-        if sq and self._terrain_loop_square != sq:
-            if self._terrain_loop and self._terrain_loop.is_playing():
-                self._terrain_loop.stop()
-            if sq not in self.scouted_squares and sq not in self.scouted_before_squares:
-                return
-            t = sq.type_name
-            if t:
-                st = style.get(t, "noise")
-                if st:
-                    if st[0] == "loop":
-                        try:
-                            volume = float(st[2])
-                        except:
-                            volume = 1
-                        self._terrain_loop = psounds.play_loop(
-                            sounds.get_sound(st[1]),
-                            volume,
-                            sq.x / 1000.0,
-                            sq.y / 1000.0,
-                            -10,
-                        )
-            self._terrain_loop_square = sq
+        if self.place:
+            squares = [self.place]
+            if parameters.d.get("render_nearby_land", False):
+                squares += self.place.neighbors
+            squares = [
+                sq
+                for sq in squares
+                if sq in self.scouted_squares or sq in self.scouted_before_squares
+            ]
+            for n in self._terrain_noises[:]:
+                if n.obj.model not in squares:
+                    n.stop()
+                    self._terrain_noises.remove(n)
+                else:
+                    n.update()
+            for sq in squares:
+                if sq not in [n.obj.model for n in self._terrain_noises]:
+                    t = sq.type_name
+                    if t:
+                        st = style.get(t, "noise")
+                        n = noise(SquareView(self, sq), st)
+                        if n:
+                            self._terrain_noises.append(n)
 
     previous_animation = 0
 
     def _animate_objects(self):
-        if time.time() >= self.previous_animation + 0.1:
+        if time.time() >= self.previous_animation + parameters.d.get("animation_delay", 0.1):
             chrono.start("animate")
             try:
                 self.set_obs_pos()
             except:
                 exception("couldn't set user interface position")
-            for o in list(self.dobjets.values()):
+            for o in self.dobjets.values():
                 try:
                     o.animate()
                 except:
@@ -911,7 +946,33 @@ class GameInterface:
             e = self._srv_queue.get()
             self._process_srv_event(*e)
 
-    def loop(self):
+    def get_bindings(self):
+        b = res.text("ui/bindings", append=True, localize=True)
+        try:
+            b += "\n" + open(CUSTOM_BINDINGS_PATH).read()
+        except OSError:
+            pass
+        return b
+
+    def run_game(self, game):
+        t = threading.Thread(target=game.world.loop)
+        t.daemon = True
+        t.start()
+
+        update_orders_list()  # when style has changed
+        game.pre_run()
+        if game.world.objective:
+            voice.confirmation(mp.OBJECTIVE + game.world.objective)
+        self.load_bindings(self.get_bindings())
+        if PROFILE:
+            cProfile.runctx("self._loop()", globals(), locals(), "interface_profile.tmp")
+        else:
+            self._loop()
+        game._record_stats(game.world)
+        game.post_run()
+        game.world.stop()
+
+    def _loop(self):
         from .clientserver import ConnectionAbortedError
 
         set_game_mode(True)
@@ -931,6 +992,9 @@ class GameInterface:
                     self._ask_for_update()
                 self._animate_objects()
                 self._process_events()
+                if self.auto:
+                    if self.auto[0].run(self):
+                        del self.auto[0]
                 self._process_srv_events()
                 voice.update()  # useful for SAPI
                 time.sleep(0.001)
@@ -941,9 +1005,6 @@ class GameInterface:
             except:
                 exception("error in clientgame loop")
         set_game_mode(False)
-
-    mode = None
-    indexunite = -1
 
     immersion = False
 
@@ -1341,11 +1402,11 @@ class GameInterface:
         self.order = None
 
     def cmd_unit_status(self):
-        try:
-            place = self.dobjets[self.group[0]].place.title
-        except:
-            place = self.place.title
-        self.say_group(place)
+        if self.group:
+            place_title = self.dobjets[self.group[0]].place.title
+        else:
+            place_title = getattr(self.place, "title", [])
+        self.say_group(place_title)
         if self.group:
             self.follow_mode = True
             self._follow_if_needed()
@@ -1675,18 +1736,19 @@ class GameInterface:
         return -1, -1
 
     def move_to_square(self, square):
-        if hasattr(square.place, "col"):  # square is actually a container
-            square = square.place
+        if square.__class__.__name__ == "Inside":
+            square = square.outside
         if self.place is not square and self.coords_in_map(square) != (-1, -1):
             self.place = square
-            self._silence_square()
+            if parameters.d.get("silence_previous_square", True):
+                self._silence_square()
             self.display()
 
     def _silence_square(self):
         for o in list(self.dobjets.values()):
             if not o.is_in(self.place):
                 o.stop()
-        sound_stop(stop_voice_too=False)  # cut the long nonlooping environment sounds
+        sound.stop(stop_voice_too=False)  # cut the long non-looping environment sounds
 
     def _square_terrain(self, place):
         result = []
@@ -1777,7 +1839,10 @@ class GameInterface:
                 or dyc == -1
                 and o.y < y
             ):
-                prefix = o.when_moving_through
+                if parameters.d.get("play_movement_sound", True):
+                    prefix = o.when_moving_through
+                else:
+                    prefix = []
                 collision = False
                 break
         return prefix, collision
@@ -1827,18 +1892,22 @@ class GameInterface:
                 self._select_and_say_square(self.place, prefix)
 
     def _select_square_from_list(self, increment, squares):
+        squares = [s for s in squares if isinstance(s, Square)]
         if squares:
             if self.immersion:
                 self.toggle_immersion()
             if self.zoom_mode:
                 self.cmd_toggle_zoom()
             _squares = list(squares)  # make a copy
-            if self.place not in _squares:
+            if isinstance(self.place, Square) and self.place not in _squares:
                 _squares.append(self.place)
             if self.player.units:
                 u = self.player.units[0]
                 _squares.sort(key=lambda s: distance(s.x, s.y, u.x, u.y))
-            index = _squares.index(self.place) + int(increment)
+            try:
+                index = _squares.index(self.place) + int(increment)
+            except ValueError:
+                index = 0
             if index < 0:
                 index = len(_squares) - 1
             elif index == len(_squares):
@@ -1889,10 +1958,14 @@ class GameInterface:
             self.x, self.y = self.zoom.obs_pos()
         else:
             xc, yc = self.coords_in_map(self.place)
-            self.x = self.square_width * (xc + 0.5)
-            self.y = self.square_width * (yc + 1 / 8.0)
-            if self.place not in self.scouted_squares:
-                self.y -= self.square_width  # lower sounds if fog of war
+            x = self.square_width * (xc + 0.5)
+            y = self.square_width * (yc + 1 / 8.0)
+            if (x, y) != (self.x, self.y):
+                k = min((time.time() - self.previous_animation) * parameters.d.get("observer_reactivity", 1000), 1)
+                self.x += (x - self.x) * k
+                self.y += (y - self.y) * k
+        if not self.immersion:
+            self.o = 90
         psounds.update()
 
     def cmd_toggle_zoom(self):
@@ -2088,10 +2161,7 @@ class GameInterface:
         if (
             self.available_food != self._previous_available_food
             or self.used_food > self._previous_used_food
-            or (
-                self.used_food < self._previous_used_food
-                and self._previous_used_food == self.available_food
-            )
+            or self.used_food < self._previous_used_food == self.available_food
         ):
             if (
                 "food" in config.verbosity

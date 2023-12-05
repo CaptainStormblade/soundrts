@@ -9,6 +9,23 @@ VIRTUAL_TIME_INTERVAL = 300  # milliseconds
 MAX_NB_OF_RESOURCE_TYPES = 10
 
 
+def _get_base_classes():
+    from .worldability import Ability
+    from .worldresource import Deposit
+    from .worldunit import Worker, Soldier, Building, Effect
+    from .worldupgrade import Upgrade
+
+    return {
+        "worker": Worker,
+        "soldier": Soldier,
+        "building": Building,
+        "effect": Effect,
+        "deposit": Deposit,
+        "upgrade": Upgrade,
+        "ability": Ability,
+    }
+
+
 def _update_old_definitions(d, name):
     if "sight_range" in d and d["sight_range"] == 1 * PRECISION:
         d["sight_range"] = 12 * PRECISION
@@ -143,12 +160,14 @@ class _Definitions:
             return
         return o[attr]
 
-    def get(self, obj, attr):
+    def get(self, obj, attr, default=None):
         v = self._val(obj, attr)
         if v is None and attr[-8:-1] == "_level_":
             v = self._val(obj, attr[:-8])
         if isinstance(v, list):
             v = v[:]
+        if v is None and default is not None:
+            return default
         return v
 
     def get_dict(self, obj):
@@ -158,8 +177,7 @@ class _Definitions:
         return list(self._dict.keys())
 
     def copy(self, other):
-        self._dict = other._dict
-
+        self.__dict__ = other.__dict__
 
 _precision_properties = {
     "armor",
@@ -237,8 +255,9 @@ class Rules(_Definitions):
     }
     precision_list_properties = {"cost", "storage_bonus"}
 
-    def normalize_cost_or_resources(self, lst):
-        n = self.get("parameters", "nb_of_resource_types")
+    def normalized_cost_or_resources(self, lst):
+        lst = lst[:]
+        n = self.get("parameters", "nb_of_resource_types", 2)
         while len(lst) < n:
             lst += [0]
         while len(lst) > n:
@@ -249,7 +268,7 @@ class Rules(_Definitions):
         if hasattr(base, "interpret"):
             base.interpret(d)
         if "cost" not in d and hasattr(base, "cost"):
-            d["cost"] = [0] * self.get("parameters", "nb_of_resource_types")
+            d["cost"] = [0] * self.get("parameters", "nb_of_resource_types", 2)
         d = _update_old_definitions(d, name)
         for k, v in list(d.items()):
             if k == "class":
@@ -263,9 +282,11 @@ class Rules(_Definitions):
                     "in %s: %s doesn't have any attribute called '%s'", name, base, k,
                 )
             elif k == "cost":
-                d[k] = self.normalize_cost_or_resources(v)
+                d[k] = self.normalized_cost_or_resources(v)
 
-    def load(self, *strings, classes=()):
+    def load(self, *strings, base_classes=None):
+        if base_classes is None:
+            base_classes = _get_base_classes()
         self._dict = {}
         for s in strings:
             s = re.sub(r"^[ \t]*class +race\b", "class faction", s, flags=re.M)
@@ -274,8 +295,8 @@ class Rules(_Definitions):
         d = {}
         for k, v in self._dict.items():
             cls = v.get("class", [None])[0]
-            if cls in classes:
-                base = classes[cls]
+            if cls in base_classes:
+                base = base_classes[cls]
                 self.interpret(v, base, k)
                 d[k] = type(k, (base,), v)
                 d[k].type_name = k
@@ -287,6 +308,69 @@ class Rules(_Definitions):
         result.remove("parameters")
         return result
 
+    @property
+    def factions(self):
+        return [c for c in self.classnames() if self.get(c, "class") == ["faction"]]
+
+    def unit_class(self, s):
+        """Get a custom unit class from its name.
+
+        Example: unit_class("peasant") to get the peasant class
+
+        At the moment, unit_classes contains also: upgrades, abilities...
+        """
+        try:
+            return self.classes[s]
+        except KeyError:
+            return
+
+    def equivalent_type(self, t, faction):
+        tn = getattr(t, "type_name", "")
+        if rules.get(faction, tn):
+            return self.unit_class(rules.get(faction, tn)[0])
+        return t
+
+    def _get_classnames(self, condition):
+        result = []
+        for c in self.classnames():
+            uc = self.unit_class(c)
+            if uc is not None and condition(uc):
+                result.append(c)
+        return result
+
+    def get_makers(self, t):
+        def can_make(uc, t):
+            for a in ("can_build", "can_train", "can_upgrade_to", "can_research"):
+                if t in getattr(uc, a, []):
+                    return True
+            for ability in getattr(uc, "can_use", []):
+                effect = self.get(ability, "effect")
+                if effect and "summon" in effect[:1] and t in effect:
+                    return True
+
+        if t.__class__ != str:
+            t = t.__name__
+        return self._get_classnames(lambda uc: can_make(uc, t))
+
+
+def parse_noise(st):
+    if st:
+        if st[0] == "if_me":
+            return "if_me", parse_noise(st[1]), parse_noise(st[2])
+        ambient = st[0] == "ambient"
+        if ambient:
+            st = st[1:]
+        t = st[0]
+        if t == "loop":
+            try:
+                v = float(st[2])
+            except IndexError:
+                v = 1
+            return "loop", st[1], v, ambient
+        if t == "repeat":
+            return "repeat", float(st[1]), st[2:], ambient
+    return ()
+
 
 class Style(_Definitions):
     def __init__(self):
@@ -296,19 +380,34 @@ class Style(_Definitions):
         self._dict = {}
         for s in strings:
             self.read(s)
+        for d in self._dict.values():
+            for k, v in d.items():
+                if v and v[0] == "if_me":
+                    if "else" in v:
+                        i = v.index("else")
+                        v = "if_me", v[1:i], v[i + 1:]
+                    else:
+                        v = "if_me", v[1:], []
+                if k.startswith("noise"):
+                    try:
+                        v = parse_noise(v)
+                    except:
+                        warning("problem with noise: %s", " ".join(d[k]))
+                d[k] = v
         self.apply_inheritance()
 
     def get(self, obj, attr, warn_if_not_found=True):
         result = _Definitions.get(self, obj, attr)
-        if result is None and warn_if_not_found:
+        if result is None:
             result = []  # the caller might expect a list
-            if (obj, attr) not in self._style_warnings:
-                self._style_warnings.append((obj, attr))
-                warning("no value found for %s.%s (check style.txt)", obj, attr)
+            if warn_if_not_found:
+                if (obj, attr) not in self._style_warnings:
+                    self._style_warnings.append((obj, attr))
+                    warning("no value found for %s.%s (check style.txt)", obj, attr)
         return result
 
     def has(self, obj, attr):
-        return self.get(obj, attr, False) is not None
+        return _Definitions.get(self, obj, attr) is not None
 
 
 # AI (probably completely separate)

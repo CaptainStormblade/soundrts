@@ -1,5 +1,3 @@
-"""This ugly module is fighting with res.py to make some useful job."""
-
 import os
 import platform
 
@@ -7,10 +5,10 @@ import pygame
 
 from . import config
 from . import msgparts as mp
-from . import res
+from .lib import sound
 from .lib.msgs import nb2msg
+from .lib.resource import res
 from .lib.screen import set_screen
-from .lib.sound import get_volume, init_sound, set_volume, sound_stop
 from .lib.sound_cache import sounds
 from .lib.voice import voice
 from .version import VERSION
@@ -22,17 +20,21 @@ if platform.system() == "Windows":
 fullscreen = False
 
 
+def app_title():
+    return f"SoundRTS {VERSION} {res.mods} {res.soundpacks}"
+
+
 def update_display_caption():
     """set the window title"""
-    pygame.display.set_caption(f"SoundRTS {VERSION} {res.mods} {res.soundpacks}")
+    pygame.display.set_caption(app_title())
 
 
 def minimal_init():
     """initialize sound, voice, screen, window title, keyboard"""
-    init_sound(config.num_channels)
+    sound.init(config.num_channels)
     voice.init(config)
     set_screen(fullscreen)
-    update_display_caption()
+    res.register(update_display_caption)
     pygame.key.set_repeat(500, 100)
 
 
@@ -45,9 +47,9 @@ def init_media():
 
 def modify_volume(incr):
     """increase or decrease the main volume, and say it"""
-    set_volume(min(1, max(0, get_volume() + 0.1 * incr)))
-    sound_stop()
-    voice.item(nb2msg(round(get_volume() * 100)) + mp.PERCENT_VOLUME)
+    sound.main_volume = min(1, max(0, sound.main_volume + 0.1 * incr))
+    sound.stop()
+    voice.item(nb2msg(round(sound.main_volume * 100)) + mp.PERCENT_VOLUME)
 
 
 def toggle_fullscreen():
@@ -68,12 +70,12 @@ def get_fullscreen():
 
 def close_media():
     """try to clean up before closing the client"""
-    sound_stop()
+    sound.stop()
     pygame.quit()
 
 
 def play_sequence(names):
     """play a sequence of sounds or texts, each one interruptible"""
-    sound_stop()
+    sound.stop()
     for name in names:
         voice.important([name])  # each element is interruptible

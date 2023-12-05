@@ -4,65 +4,22 @@ import re
 from typing import Dict, List, Union
 
 from . import msgparts as mp
-from .definitions import MAX_NB_OF_RESOURCE_TYPES, rules, style
+from .definitions import MAX_NB_OF_RESOURCE_TYPES, rules
 from .lib import group
 from .lib.log import exception, info, warning
-from .lib.msgs import encode_msg, nb2msg
+from .lib.msgs import encode_msg
 from .lib.nofloat import PRECISION, square_of_distance, to_int
+from soundrts.worldplayerstats import Stats
 from .worldability import Ability
-from .worldaction import AttackAction
 from .worldentity import NotEnoughSpaceError
 from .worldexit import Exit
 from .worldresource import Corpse, Deposit
-from .worldroom import Square
+from .worldroom import Square, ZoomTarget
 from .worldunit import BuildingSite, Soldier, Unit
 from .worldupgrade import is_an_upgrade
 
 A = 12 * PRECISION  # bucket side length
 VERY_SLOW = int(0.01 * PRECISION)
-
-
-class ZoomTarget:
-
-    collision = 0
-    radius = 0
-
-    def __init__(self, place, x, y, id=None):
-        self.place = place
-        self.x = x
-        self.y = y
-        self.id = id
-        self.title = self.place.title  # TODO: full zoom title
-
-    def __eq__(self, other):
-        if isinstance(other, ZoomTarget):
-            return self.x, self.y == other.x, other.y
-
-    def __ne__(self, other):
-        return not self.__eq__(other)
-
-    @property
-    def building_land(self):
-        for o in self.place.objects:
-            if o.is_a_building_land and self.contains(o.x, o.y):
-                return o
-
-    @property
-    def exit(self):
-        for o in self.place.exits:
-            if not o.is_blocked() and self.contains(o.x, o.y):
-                return o
-
-    @property
-    def any_land(self):
-        for o in self.place.objects:
-            if getattr(o, "is_buildable_anywhere", False) and self.contains(o.x, o.y):
-                return
-        return self
-
-    def contains(self, x, y):
-        subsquare = self.place.world.get_subsquare_id_from_xy
-        return subsquare(self.x, self.y) == subsquare(x, y)
 
 
 class Objective:
@@ -72,6 +29,9 @@ class Objective:
 
 
 class Player:
+    resources: List[int]
+    triggers: list
+    _buckets: Dict[tuple, list]
 
     cheatmode = False
     used_food = 0
@@ -85,16 +45,18 @@ class Player:
     group = ()
     group_had_enough_mana = False  # used to warn if not enough mana
 
+    AI_type = ""
     is_cpu_intensive = False
     smart_units = False
 
     groups: Dict[str, List[Unit]] = {}
 
     def __init__(self, world, client):
-        self._attacker_places = []
+        self.stats = Stats(self)
+        self._counterattack_places = []
         self.neutral = client.neutral
         self.faction = (
-            world.random.choice(world.factions)
+            world.random.choice(rules.factions)
             if client.faction == "random_faction"
             else client.faction
         )
@@ -138,6 +100,27 @@ class Player:
     @property
     def is_playing(self):
         return not (self.has_victory or self.has_been_defeated)
+
+    def add(self, unit):
+        unit.number = unit.next_free_number()
+        self.units.append(unit)
+        self.food += unit.food_provided
+        self.used_food += unit.food_cost
+        unit.upgrade_to_player_level()
+        # player units must stop attacking the "not hostile anymore" unit
+        for u in self.units:
+            if u.action_target is unit:
+                u.stop()
+        # note: updating perception so quickly shouldn't be necessary
+        # (now that perception isn't strictly limited to squares)
+        # It doesn't take time though.
+        for p in self.allied_vision:
+            p.perception.add(unit)  # necessary for example for new building sites
+
+    def remove(self, unit):
+        self.units.remove(unit)
+        self.food -= unit.food_provided
+        self.used_food -= unit.food_cost
 
     def raise_threat(self, subsquare, delta):
         try:
@@ -206,7 +189,7 @@ class Player:
         for p in self.allied:
             for upgrade_name in p.upgrades:
                 while self.level(upgrade_name) < p.level(upgrade_name):
-                    self.world.unit_class(upgrade_name).upgrade_player(self)
+                    rules.unit_class(upgrade_name).upgrade_player(self)
 
     def _potential_neighbors(self, x, y):
         result = []
@@ -349,7 +332,7 @@ class Player:
         for l in (self.perception, self.memory):
             for o in sorted(l, key=lambda x: x.id):  # sort to avoid desync error
                 place = o.place
-                if not hasattr(place, "exits"):
+                if not isinstance(place, Square):
                     continue
                 if self.is_an_enemy(o):
                     menace = o.menace
@@ -419,7 +402,7 @@ class Player:
     def squares_to_watch(self) -> List[Square]:
         squares = set()  # desync risk
         for m in self.memory:  # desync risk
-            if not isinstance(m.place, Square):  # transport
+            if m.is_inside:
                 continue
             if self.is_an_enemy(m):
                 squares.add(m.place)
@@ -482,6 +465,17 @@ class Player:
             ):
                 u.die()
 
+    def _update_counterattacks(self):
+        nearby_attacker_places = {}
+        for attacker_place in self._counterattack_places:
+            for neighbor in attacker_place.neighbors:
+                if neighbor not in self._counterattack_places:
+                    nearby_attacker_places[neighbor] = attacker_place
+        self._counterattack_places = []
+        for unit in self.units:
+            if unit.place in nearby_attacker_places:
+                unit.counterattack(nearby_attacker_places[unit.place])
+
     def update(self):
         self._update_actual_speed()
         self._update_storage_bonus()
@@ -491,25 +485,7 @@ class Player:
         self._update_enemy_menace_and_presence_and_corpses()
         self.play()
         self._update_drowning()
-
-        # counter-attack
-        a = dict()
-        for p in self._attacker_places:
-            for n in p.neighbors:
-                a[n] = p
-        self._attacker_places = []
-        for u in self.units:
-            if (
-                u.speed
-                and u.menace
-                and not u.orders
-                and u.action.__class__ != AttackAction
-                and u.place in a
-            ):
-                u.take_order(["go", a[u.place].id])
-                u.take_order(
-                    ["go", f"zoom-{u.place.id}-{u.x}-{u.y}"], forget_previous=False
-                )
+        self._update_counterattacks()
 
     def level(self, type_name):
         return self.upgrades.count(type_name)
@@ -537,11 +513,21 @@ class Player:
             return self.world.grid[i]
         if i in self.world.objects:
             o = self.world.objects[i]
-            if o in self.world.squares or o in self.perception:
+            if isinstance(o, Square):
+                return o
+            if o.place and o in self.perception:
                 return o
         for o in self.memory:
             if o.id == i:
                 return o
+
+    def updated_target(self, target):
+        if (
+                isinstance(target, (ZoomTarget, Square))  # doesn't change
+                or ((target in self.perception or target in self.memory) and target.place)
+        ):
+            return target
+        return self.get_object_by_id(target.id)
 
     def is_local_human(self):
         return hasattr(self.client, "interface")
@@ -653,13 +639,6 @@ class Player:
     def send_voice_important(self, msg):
         self.push("voice_important", encode_msg(msg))
 
-    nb_units_produced = 0
-    nb_units_lost = 0
-    nb_units_killed = 0
-    nb_buildings_produced = 0
-    nb_buildings_lost = 0
-    nb_buildings_killed = 0
-
     def equivalent(self, tn):
         if rules.get(self.faction, tn):
             return rules.get(self.faction, tn)[0]
@@ -672,45 +651,32 @@ class Player:
             if self.client.alliance == p.client.alliance:
                 self.allied.append(p)
 
-    def init_position(self):
-        def equivalent_type(t):
-            tn = getattr(t, "type_name", "")
-            if rules.get(self.faction, tn):
-                return self.world.unit_class(rules.get(self.faction, tn)[0])
-            return t
+    def init_position(self, parsed_start):
+        units, self.upgrades, self.forbidden_techs, resources, triggers = parsed_start
 
-        self.resources = self.start[0][:]
-        rules.normalize_cost_or_resources(self.resources)
-        self.gathered_resources = self.resources[:]
-        for place, type_, n in self.start[1]:
-            if self.world.must_apply_equivalent_type:
-                type_ = equivalent_type(type_)
-            if isinstance(type_, str) and type_[0:1] == "-":
-                self.forbidden_techs.append(type_[1:])
-            elif is_an_upgrade(type_):
-                self.upgrades.append(
-                    type_.type_name
-                )  # type_.upgrade_player(self) would require the units already there
-            elif not type_:
-                warning("couldn't create an initial unit")
-            else:
-                place = self.world.grid[place]
-                for _ in range(n):
-                    x, y, land = place.find_and_remove_meadow(type_)
-                    x, y = place.find_free_space(type_.airground_type, x, y)
-                    if x is not None:
-                        unit = type_(self, place, x, y)
-                        unit.building_land = land
+        self.resources = resources
+        for index, qty in enumerate(self.resources):
+            self.stats.add("gathered", index, qty)
 
-        self.triggers = self.start[2]
+        for place, n, type_ in units:
+            for _ in range(n):
+                self.add_unit(type_, place)
+        self.triggers = triggers
 
-        if rules.get(self.faction, getattr(self, "AI_type", "")):
-            self.set_ai(rules.get(self.faction, self.AI_type)[0])
+    def set_ai(self, ai_type):
+        pass
+
+    def add_unit(self, type_, place):
+        x, y, land = place.find_and_remove_meadow(type_)
+        x, y = place.find_free_space(type_.airground_type, x, y)
+        if x is not None:
+            unit = type_(self, place, x, y)
+            unit.building_land = land
 
     def store(self, _type, qty):
         qty += self.storage_bonus[_type]
         self.resources[_type] += qty
-        self.gathered_resources[_type] += qty
+        self.stats.add("gathered", _type, qty)
 
     def run_triggers(self):
         if not self.is_playing:
@@ -736,6 +702,8 @@ class Player:
         return self.world.time // 1000 >= float(args[0]) * self.world.timer_coefficient
 
     def lang_order(self, args):
+        default_square = "a1"
+        n = 1
         select, orders = args
         for x in select:
             if x in self.world.grid:
@@ -806,7 +774,7 @@ class Player:
             u.notify("added")
 
     def lang_add_units(
-        self, items, target=None, decay=0, from_corpse=False, corpses=[], notify=True
+        self, items, target=None, decay=0, from_corpse=False, corpses=None, notify=True
     ):
         square = self.world.grid["a1"]
         nb = 1
@@ -817,7 +785,7 @@ class Player:
             elif re.match("[0-9]+$", i):
                 nb = int(i)
             else:
-                cls = self.world.unit_class(i)
+                cls = rules.unit_class(i)
                 if is_an_upgrade(cls):
                     self.upgrades.append(i)
                     self.send_voice_important(mp.OK)
@@ -862,93 +830,18 @@ class Player:
                 return False
         return True
 
-    def consumed_resources(self):
-        return [
-            self.gathered_resources[i] - self.resources[i]
-            for i, c in enumerate(self.resources)
-        ]
-
-    def _get_score(self):
-        score = (
-            self.nb_units_produced
-            - self.nb_units_lost
-            + self.nb_units_killed
-            + self.nb_buildings_produced
-            - self.nb_buildings_lost
-            + self.nb_buildings_killed
-        )
-        for i, _ in enumerate(self.resources):
-            score += (
-                self.gathered_resources[i] + self.consumed_resources()[i]
-            ) // PRECISION
-        return score
-
-    def _get_score_msgs(self):
-        if self.has_victory:
-            victory_or_defeat = mp.VICTORY
-        else:
-            victory_or_defeat = mp.DEFEAT
-        t = self.world.time // 1000
-        m = int(t // 60)
-        s = int(t - m * 60)
-        msgs = []
-        msgs.append(
-            victory_or_defeat + mp.AT + nb2msg(m) + mp.MINUTES + nb2msg(s) + mp.SECONDS
-        )
-        msgs.append(
-            nb2msg(self.nb_units_produced)
-            + mp.UNITS
-            + mp.PRODUCED_F
-            + mp.COMMA
-            + nb2msg(self.nb_units_lost)
-            + mp.LOST
-            + mp.COMMA
-            + nb2msg(self.nb_units_killed)
-            + mp.NEUTRALIZED
-        )
-        msgs.append(
-            nb2msg(self.nb_buildings_produced)
-            + mp.BUILDINGS
-            + mp.PRODUCED_M
-            + mp.COMMA
-            + nb2msg(self.nb_buildings_lost)
-            + mp.LOST
-            + mp.COMMA
-            + nb2msg(self.nb_buildings_killed)
-            + mp.NEUTRALIZED
-        )
-        res_msg = []
-        for i, _ in enumerate(self.resources):
-            res_msg += (
-                nb2msg(self.gathered_resources[i] // PRECISION)
-                + style.get("parameters", "resource_%s_title" % i)
-                + mp.GATHERED
-                + mp.COMMA
-                + nb2msg(self.consumed_resources()[i] // PRECISION)
-                + mp.CONSUMED
-                + mp.PERIOD
-            )
-        msgs.append(res_msg[:-1])
-        msgs.append(mp.SCORE + nb2msg(self._get_score()) + mp.HISTORY_EXPLANATION)
-        return msgs
-
-    score_msgs = ()
-
-    def store_score(self):
-        self.score_msgs = self._get_score_msgs()
-
     def victory(self):
         for p in self.world.players:
             if p.is_playing:
                 if p in self.allied_victory:
                     p.has_victory = True
-                    p.store_score()
+                    p.stats.freeze()
                 else:
                     p.defeat()
 
     def defeat(self, force_quit=False):
         self.has_been_defeated = True
-        self.store_score()
+        self.stats.freeze()
         if self in self.world.true_players():
             self.broadcast_to_others_only(self.name + mp.HAS_BEEN_DEFEATED)
         for u in self.units[:]:
@@ -956,13 +849,7 @@ class Player:
         if force_quit:
             self.quit_game()
         elif self.observer_if_defeated and self.world.true_playing_players:
-            the_game_will_probably_continue = False
-            allied_victory = self.world.true_playing_players[0].allied_victory
-            for p in self.world.true_playing_players:
-                if p not in allied_victory:
-                    the_game_will_probably_continue = True
-                    break
-            if the_game_will_probably_continue:
+            if self.world.at_least_two_camps:
                 self.send_voice_important(
                     mp.YOU_HAVE_BEEN_DEFEATED + mp.YOU_ARE_NOW_IN_OBSERVER_MODE
                 )
@@ -1002,7 +889,7 @@ class Player:
         self.set_ai(args[0])
 
     def lang_faction(self, args):
-        if args and args[0] in self.world.factions:
+        if args and args[0] in rules.factions:
             self.faction = args[0]
         else:
             warning("unknown faction: %s", " ".join(args))
@@ -1012,8 +899,8 @@ class Player:
         return min(self.food, self.world.food_limit)
 
     def on_unit_attacked(self, unit, attacker):
-        if attacker in self.perception and attacker.place not in self._attacker_places:
-            self._attacker_places.append(attacker.place)
+        if attacker in self.perception and attacker.place not in self._counterattack_places:
+            self._counterattack_places.append(attacker.place)
 
     def player_is_an_enemy(self, p):
         return p not in self.allied
@@ -1057,7 +944,7 @@ class Player:
         return result
 
     def check_count_limit(self, type_name):
-        t = self.world.unit_class(type_name)
+        t = rules.unit_class(type_name)
         if t is None:
             info("couldn't check count_limit for %r", type_name)
             return False
@@ -1143,7 +1030,7 @@ class Player:
                 self._reset_group(args[1])
                 return
             for u in self.group:
-                if u.group and u.group != self.group:
+                if u.group is not None and u.group != self.group:
                     if u in u.group:
                         u.group.remove(u)
                     u.group = None

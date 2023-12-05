@@ -71,18 +71,8 @@ class Order:
         self.unit.distance_to_goal = 0
 
     def update_target(self):
-        t = self.target
-        p = self.unit.player
-        if (
-            t is not None
-            and type(t).__name__ != "ZoomTarget"
-            and t not in p.world.squares
-            and t not in p.perception
-            and t not in p.memory
-        ):
-            self.target = p.get_object_by_id(t.id)
-        if hasattr(self.target, "place") and self.target.place is None:
-            self.target = None
+        if self.target:
+            self.target = self.player.updated_target(self.target)
 
     def _group_is_ready(self):
         for u in self.player.units:
@@ -335,7 +325,7 @@ class ComplexOrder(Order):
 
     def __init__(self, unit, args):
         Order.__init__(self, unit, args[1:])
-        self.type = self.player.world.unit_class(args[0])
+        self.type = rules.unit_class(args[0])
 
     @property
     def cost(self):
@@ -368,7 +358,7 @@ class ComplexOrder(Order):
     @classmethod
     def is_allowed(cls, unit, type_name, *unused_args):
         return cls._is_almost_allowed(unit, type_name) and unit.player.has_all(
-            unit.player.world.unit_class(type_name).requirements
+            rules.unit_class(type_name).requirements
         )
 
     @classmethod
@@ -468,14 +458,10 @@ class TrainOrder(ProductionOrder):
                 self.cancel()
                 self.mark_as_impossible("not_enough_space")
                 return
-            x, y = place.find_free_space(
-                self.type.airground_type, place.x, place.y, player=self.player
-            )
+            x, y = place.find_free_space(self.type.airground_type, place.x, place.y)
         else:
             place = self.unit.place
-            x, y = place.find_free_space(
-                self.type.airground_type, self.unit.x, self.unit.y, player=self.player
-            )
+            x, y = place.find_free_space(self.type.airground_type, self.unit.x, self.unit.y)
         if x is None:
             self.cancel()
             self.mark_as_impossible("not_enough_space")
@@ -603,6 +589,11 @@ class GoOrder(BasicOrder):
             self.unit.hold(self.target)
             self.mark_as_complete()
         elif self.unit._near_enough(self.target):
+            try:
+                if self.target.have_enough_space(self.unit):
+                    self.target.load(self.unit)
+            except AttributeError:
+                pass
             self.mark_as_complete()
         elif self.unit.is_idle:
             self.move_to_or_fail(self.target)
@@ -622,7 +613,7 @@ class AttackOrder(BasicOrder):
 
     def execute(self):
         self.update_target()
-        if self.target is None:
+        if not getattr(self.target, "is_vulnerable", False):
             self.mark_as_impossible()
             return
         if self.unit._near_enough_to_aim(self.target):
@@ -929,12 +920,7 @@ class BuildOrder(ComplexOrder):
             return
         if self.target is self.unit.place or self.target.place is self.unit.place:
             self.player.free_resources(self)
-            x, _ = self.unit.place.find_free_space(
-                self.type.airground_type,
-                self.target.x,
-                self.target.y,
-                player=self.player,
-            )
+            x, _ = self.unit.place.find_free_space(self.type.airground_type, self.target.x, self.target.y)
             if x is None:
                 self.cancel()
                 self.mark_as_impossible("not_enough_space")
@@ -1205,7 +1191,10 @@ class LoadOrder(TransportOrder):
             else:
                 self.mark_as_impossible()
         elif self.unit.place != self.target.place:
-            self.move_to_or_fail(self.target.place)
+            if self.unit.speed:
+                self.move_to_or_fail(self.target.place)
+            else:
+                self.mark_as_complete()
         else:
             self.mark_as_complete()
             self.unit.load(self.target)
